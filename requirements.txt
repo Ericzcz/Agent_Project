@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+
+langchain
+langchain-core
+langchain-community
+langchain-openai
+langchain-text-splitters
+
+chromadb
+pymupdf
+unstructured
+markdown
