@@ -2,6 +2,9 @@ import json
 import asyncio
 from typing import Awaitable, Callable, Dict
 
+from langsmith import traceable
+from langsmith.wrappers import wrap_openai
+
 from openai import AsyncOpenAI
 from tavily import TavilyClient
 
@@ -40,8 +43,6 @@ def search_web(query: str) -> str:
     return "\n\n".join(blocks)
 
 
-async def search_web_async(query: str) -> str:
-    return await asyncio.to_thread(search_web, query)
 
 def get_tools():
     return [
@@ -87,7 +88,13 @@ def get_tools():
         },
     ]
 
-
+@traceable(
+        name="Week4 Agent",
+        run_type="chain",
+        process_inputs=lambda inputs: {
+            "query": inputs["user_query"],
+        },
+    )
 async def run_agent(
     user_query: str,
     *,
@@ -95,11 +102,16 @@ async def run_agent(
     tool_response_model: str | None = None,
     instructions: str | None = None,
 ) -> str:
-    client = AsyncOpenAI()
+    client = wrap_openai(AsyncOpenAI())
     tools = get_tools()
 
+    @traceable(run_type="tool", name="Local Knowledge Search")
     async def local_tool(query: str) -> str:
         return await search_local_knowledge(query, model)
+    
+    @traceable(run_type="tool", name="Web Search")
+    async def search_web_async(query: str) -> str:
+        return await asyncio.to_thread(search_web, query)
     
     tool_handlers: Dict[str, Callable[[str], Awaitable[str]]] = {
         "search_local_knowledge": local_tool,
@@ -155,6 +167,7 @@ async def run_one_agent(query: str, model: str, sem: asyncio.Semaphore) -> dict[
                 "error": str(e),
             }
 
+@traceable(name="Week4 Agent Batch", run_type="chain")
 async def run_agent_batch(
     queries: list[str],
     model: str,

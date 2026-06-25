@@ -1,7 +1,9 @@
 from app.Redis_Celery.celery_app import celery_app
 from app.rag_chain import build_milvus_collection
+from langsmith import traceable
 
 @celery_app.task(bind=True)
+@traceable(name="Week4 Build Milvus Index", run_type="chain")
 def index_document(
     self, 
     collection_name: str = "RAG_collection", 

@@ -1,9 +1,9 @@
 import os
 import asyncio
-import subprocess
 from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, List
+from langsmith import traceable
 
 from dotenv import find_dotenv, load_dotenv
 from langchain_community.document_loaders import (
@@ -29,19 +29,14 @@ load_dotenv(find_dotenv(), override=True)
 
 
 def get_project_root() -> Path:
-    try:
-        return Path(
-            subprocess.check_output(
-                ["git", "rev-parse", "--show-toplevel"],
-                text=True,
-            ).strip()
-        )
-    except Exception:
-        return Path(__file__).resolve().parents[3]
+    return Path(__file__).resolve().parents[3]
 
 
 def load_documents() -> List[Document]:
     folder_path = get_project_root() / "llm-universe" / "data_base" / "knowledge_db"
+    if not folder_path.is_dir():
+        raise RuntimeError(f"Knowledge base directory not found: {folder_path}")
+
     loaders = []
 
     for root, _, files in os.walk(folder_path):
@@ -56,6 +51,12 @@ def load_documents() -> List[Document]:
     documents: List[Document] = []
     for loader in loaders:
         documents.extend(loader.load())
+
+    if not documents:
+        raise RuntimeError(
+            f"No PDF or Markdown documents found in knowledge base: {folder_path}"
+        )
+
     return documents
 
 
@@ -294,15 +295,15 @@ async def rerank_documents_async(query, candidate_docs):
     
     return results
 
-def rerank_documents(query: str, candidate_docs: List[Document]) -> List[Document]:
-    reranker = CohereRerank(
-        model="rerank-v3.5",
-        top_n=8,
-    )
-    return reranker.compress_documents(
-        documents=candidate_docs,
-        query=query,
-    )
+# def rerank_documents(query: str, candidate_docs: List[Document]) -> List[Document]:
+#     reranker = CohereRerank(
+#         model="rerank-v3.5",
+#         top_n=8,
+#     )
+#     return reranker.compress_documents(
+#         documents=candidate_docs,
+#         query=query,
+#     )
 
 
 def collect_candidate_docs(query, vector_retriever, bm25_retriever): 
@@ -406,7 +407,7 @@ async def search_local_knowledge(
     )
     return result["answer"]
 
-
+@traceable(name="Generate Batch Answer", run_type="chain")
 async def answer_one_query(query: str, docs: list[Document], llm) -> str:
     context = combine_docs(docs)
 
@@ -426,6 +427,7 @@ async def answer_one_query(query: str, docs: list[Document], llm) -> str:
     return response.content
 
 
+@traceable(name="Week4 Batch Local RAG", run_type="chain")
 async def search_local_knowledge_batch(
     queries: list[str],
     model: str,
