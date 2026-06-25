@@ -21,6 +21,22 @@ DEFAULT_QUESTIONS = [
     "为什么需要 rerank？",
 ]
 
+MIXED_LOCAL_QUESTIONS = [
+    "什么是梯度下降？",
+    "什么是过拟合？",
+    "Transformer 的核心思想是什么？",
+    "什么是 RAG？",
+    "向量检索和 BM25 有什么区别？",
+]
+
+MIXED_WEB_QUESTIONS = [
+    "请调用 search_web 工具搜索网络后回答：OpenAI 官方 API 文档首页目前主要介绍什么？",
+    "请调用 search_web 工具搜索网络后回答：Python 官方网站目前推荐的最新稳定版是什么？",
+    "请调用 search_web 工具搜索网络后回答：LangChain 官方文档首页目前有哪些主要模块？",
+    "请调用 search_web 工具搜索网络后回答：Milvus 官方网站目前如何描述 Milvus？",
+    "请调用 search_web 工具搜索网络后回答：FastAPI 官方文档首页目前展示的第一个示例是什么？",
+]
+
 
 ENDPOINT_CONFIG = {
     "local_query": {"scope": "local", "model": "gpt-5.5", "kind": "single"},
@@ -35,6 +51,8 @@ class RequestResult:
     duration: float
     mode: str
     status_code: int
+    route: str = "default"
+    endpoint: str = ""
 
 
 @dataclass
@@ -45,6 +63,15 @@ class BatchRequestResult:
     item_modes: dict[str, int]
     item_count: int
     error_count: int
+
+
+@dataclass(frozen=True)
+class BenchmarkCase:
+    query: str
+    route: str
+    endpoint: str
+    scope: str
+    model: str
 
 
 def percentile(values: list[float], pct: float) -> float:
@@ -59,6 +86,33 @@ def percentile(values: list[float], pct: float) -> float:
     upper = min(lower + 1, len(ordered) - 1)
     weight = rank - lower
     return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+
+def build_mixed_cases() -> list[BenchmarkCase]:
+    cases = []
+    for local_query, web_query in zip(
+        MIXED_LOCAL_QUESTIONS,
+        MIXED_WEB_QUESTIONS,
+    ):
+        cases.extend(
+            [
+                BenchmarkCase(
+                    query=local_query,
+                    route="local",
+                    endpoint="local_query",
+                    scope="local",
+                    model="gpt-5.5",
+                ),
+                BenchmarkCase(
+                    query=web_query,
+                    route="web",
+                    endpoint="agent_query",
+                    scope="agent",
+                    model="gpt-5.5",
+                ),
+            ]
+        )
+    return cases
 
 
 async def clear_cache(
@@ -99,6 +153,7 @@ async def run_one_query(
         duration=elapsed,
         mode=payload.get("mode", "unknown"),
         status_code=response.status_code,
+        endpoint=endpoint,
     )
 
 
@@ -175,6 +230,40 @@ async def benchmark_batch_round(
     return await run_batch_query(client, endpoint=endpoint, queries=queries)
 
 
+async def benchmark_mixed_round(
+    client: httpx.AsyncClient,
+    *,
+    cases: list[BenchmarkCase],
+    mode: str,
+) -> tuple[list[RequestResult], float]:
+    for case in cases:
+        await clear_cache(
+            client,
+            question=case.query,
+            scope=case.scope,
+            model=case.model,
+        )
+
+    async def run_case(case: BenchmarkCase) -> RequestResult:
+        result = await run_one_query(
+            client,
+            endpoint=case.endpoint,
+            query=case.query,
+        )
+        result.route = case.route
+        return result
+
+    started = time.perf_counter()
+    if mode == "serial":
+        results = []
+        for case in cases:
+            results.append(await run_case(case))
+    else:
+        results = await asyncio.gather(*[run_case(case) for case in cases])
+    wall = time.perf_counter() - started
+    return results, wall
+
+
 def print_single(label: str, result: RequestResult) -> None:
     print(f"{label}: {result.duration:.3f}s mode={result.mode}")
 
@@ -220,6 +309,29 @@ def print_batch(label: str, result: BatchRequestResult) -> None:
     )
 
 
+def print_mixed(results: list[RequestResult], wall: float, mode: str) -> None:
+    print_workload(
+        f"MIXED {len(results)}-query {mode} uncached",
+        results,
+        wall,
+    )
+
+    for route in ("local", "web"):
+        route_results = [item for item in results if item.route == route]
+        if not route_results:
+            continue
+        route_wall = (
+            sum(item.duration for item in route_results)
+            if mode == "serial"
+            else max(item.duration for item in route_results)
+        )
+        print_workload(
+            f"  {route.upper()} {len(route_results)} requests",
+            route_results,
+            route_wall,
+        )
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark Week4 query endpoints.")
     parser.add_argument(
@@ -246,18 +358,42 @@ async def main() -> None:
         default="concurrent",
         help="Run single-query endpoint serially or concurrently. Ignored for batch endpoints.",
     )
+    parser.add_argument(
+        "--workload",
+        choices=["default", "mixed"],
+        default="default",
+        help=(
+            "Use the selected endpoint with default questions, or run a mixed "
+            "local-query/web-agent workload."
+        ),
+    )
     args = parser.parse_args()
 
-    if max(args.counts) > len(DEFAULT_QUESTIONS):
+    available_questions = (
+        len(build_mixed_cases())
+        if args.workload == "mixed"
+        else len(DEFAULT_QUESTIONS)
+    )
+    if max(args.counts) > available_questions:
         raise ValueError(
             f"Not enough default questions for max count={max(args.counts)}. "
-            f"Please add more questions to DEFAULT_QUESTIONS."
+            f"Maximum supported count is {available_questions}."
         )
 
     config = ENDPOINT_CONFIG[args.endpoint]
 
     async with httpx.AsyncClient(base_url=args.base_url, timeout=180.0) as client:
         for count in args.counts:
+            if args.workload == "mixed":
+                cases = build_mixed_cases()[:count]
+                results, wall = await benchmark_mixed_round(
+                    client,
+                    cases=cases,
+                    mode=args.mode,
+                )
+                print_mixed(results, wall, args.mode)
+                continue
+
             queries = DEFAULT_QUESTIONS[:count]
             if config["kind"] == "single":
                 results, wall = await benchmark_round(
